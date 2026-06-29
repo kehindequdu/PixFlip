@@ -1,385 +1,489 @@
 import os
-import io
 import logging
-import requests
-from PIL import Image
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from io import BytesIO
+import json
+from datetime import datetime
+from typing import Dict, Any
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
+import io
 
-# --- Configuration ---
-TOKEN = os.environ.get('BOT_TOKEN')
-if not TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set!")
+from utils.image_processor import ImageProcessor
+from utils.filters import FILTERS, EFFECTS
 
+# Load environment variables
+load_dotenv()
+
+# Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Global State (user temp data) ---
-user_data = {}
+# Bot token from environment
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("No TELEGRAM_BOT_TOKEN found in environment variables. Please set TELEGRAM_BOT_TOKEN in .env file")
 
-# --- Helper Functions ---
-def compress_image(image_bytes, quality=85):
-    """Compress image to reduce size"""
-    img = Image.open(BytesIO(image_bytes))
-    buffer = BytesIO()
-    img.save(buffer, format=img.format or 'JPEG', quality=quality, optimize=True)
-    return buffer.getvalue()
+# Initialize image processor
+image_processor = ImageProcessor()
 
-def convert_image_format(image_bytes, target_format):
-    """Convert image to different format"""
-    img = Image.open(BytesIO(image_bytes))
-    buffer = BytesIO()
-    
-    # Handle RGBA for JPEG conversion
-    if target_format.upper() == 'JPEG' and img.mode == 'RGBA':
-        background = Image.new('RGB', img.size, (255, 255, 255))
-        background.paste(img, mask=img.split()[3])
-        img = background
-    
-    img.save(buffer, format=target_format)
-    return buffer.getvalue()
+# Store user sessions
+user_sessions: Dict[int, Dict[str, Any]] = {}
 
-def shorten_url(url):
-    """Shorten URL using TinyURL API"""
-    try:
-        response = requests.get(f'https://tinyurl.com/api-create.php?url={url}', timeout=10)
-        if response.status_code == 200 and response.text:
-            return response.text.strip()
-        return None
-    except Exception as e:
-        logger.error(f"URL shortening error: {e}")
-        return None
+# Keyboard layouts
+MAIN_MENU = [
+    [
+        InlineKeyboardButton("🔄 Flip", callback_data="menu_flip"),
+        InlineKeyboardButton("🔄 Rotate", callback_data="menu_rotate"),
+        InlineKeyboardButton("🎨 Filters", callback_data="menu_filters"),
+    ],
+    [
+        InlineKeyboardButton("✨ Effects", callback_data="menu_effects"),
+        InlineKeyboardButton("🎯 Adjust", callback_data="menu_adjust"),
+        InlineKeyboardButton("🖼️ Border", callback_data="menu_border"),
+    ],
+    [
+        InlineKeyboardButton("💾 Download", callback_data="download"),
+        InlineKeyboardButton("↩️ Reset", callback_data="reset"),
+        InlineKeyboardButton("ℹ️ Info", callback_data="info"),
+    ],
+]
 
-def generate_ai_image(prompt):
-    """Generate image using a free AI API (Pollinations.ai)"""
-    try:
-        # Using Pollinations.ai - free image generation API
-        encoded_prompt = requests.utils.quote(prompt)
-        url = f'https://image.pollinations.ai/prompt/{encoded_prompt}?width=512&height=512'
-        response = requests.get(url, timeout=30)
-        if response.status_code == 200:
-            return response.content
-        return None
-    except Exception as e:
-        logger.error(f"AI image generation error: {e}")
-        return None
+FLIP_MENU = [
+    [
+        InlineKeyboardButton("↔️ Horizontal", callback_data="flip_h"),
+        InlineKeyboardButton("↕️ Vertical", callback_data="flip_v"),
+        InlineKeyboardButton("🔄 Both", callback_data="flip_b"),
+    ],
+    [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+]
 
-# --- Command Handlers ---
+ROTATE_MENU = [
+    [
+        InlineKeyboardButton("↺ 90°", callback_data="rotate_90"),
+        InlineKeyboardButton("↻ 180°", callback_data="rotate_180"),
+        InlineKeyboardButton("↺ 270°", callback_data="rotate_270"),
+    ],
+    [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+]
+
+FILTER_MENU = [
+    [
+        InlineKeyboardButton("🌫️ Blur", callback_data="filter_blur"),
+        InlineKeyboardButton("✨ Sharpen", callback_data="filter_sharpen"),
+        InlineKeyboardButton("🎯 Contour", callback_data="filter_contour"),
+    ],
+    [
+        InlineKeyboardButton("🏛️ Emboss", callback_data="filter_emboss"),
+        InlineKeyboardButton("🌊 Smooth", callback_data="filter_smooth"),
+        InlineKeyboardButton("🔍 Detail", callback_data="filter_detail"),
+    ],
+    [
+        InlineKeyboardButton("🎨 Edge Enhance", callback_data="filter_edge"),
+        InlineKeyboardButton("🌓 Find Edges", callback_data="filter_find_edges"),
+    ],
+    [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+]
+
+EFFECTS_MENU = [
+    [
+        InlineKeyboardButton("🎨 Sepia", callback_data="effect_sepia"),
+        InlineKeyboardButton("⚫ Grayscale", callback_data="effect_grayscale"),
+        InlineKeyboardButton("🔵 Invert", callback_data="effect_invert"),
+    ],
+    [
+        InlineKeyboardButton("🌀 Posterize", callback_data="effect_posterize"),
+        InlineKeyboardButton("🌈 Solarize", callback_data="effect_solarize"),
+        InlineKeyboardButton("🎭 Equalize", callback_data="effect_equalize"),
+    ],
+    [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+]
+
+ADJUST_MENU = [
+    [
+        InlineKeyboardButton("☀️ Brightness +", callback_data="adjust_brightness_up"),
+        InlineKeyboardButton("🌙 Brightness -", callback_data="adjust_brightness_down"),
+    ],
+    [
+        InlineKeyboardButton("🌓 Contrast +", callback_data="adjust_contrast_up"),
+        InlineKeyboardButton("🌓 Contrast -", callback_data="adjust_contrast_down"),
+    ],
+    [
+        InlineKeyboardButton("🎨 Saturation +", callback_data="adjust_saturation_up"),
+        InlineKeyboardButton("🎨 Saturation -", callback_data="adjust_saturation_down"),
+    ],
+    [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+]
+
+BORDER_MENU = [
+    [
+        InlineKeyboardButton("⬛ Black", callback_data="border_black"),
+        InlineKeyboardButton("⬜ White", callback_data="border_white"),
+        InlineKeyboardButton("🔴 Red", callback_data="border_red"),
+    ],
+    [
+        InlineKeyboardButton("🟢 Green", callback_data="border_green"),
+        InlineKeyboardButton("🔵 Blue", callback_data="border_blue"),
+        InlineKeyboardButton("🟡 Yellow", callback_data="border_yellow"),
+    ],
+    [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+]
+
+# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message with inline keyboard"""
-    keyboard = [
-        [
-            InlineKeyboardButton("🖼️ Convert Image", callback_data='convert'),
-            InlineKeyboardButton("🎨 Generate Image", callback_data='generate')
-        ],
-        [
-            InlineKeyboardButton("🔗 Shorten URL", callback_data='shorten'),
-            InlineKeyboardButton("📖 Help", callback_data='help')
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    """Handle /start command"""
+    user = update.effective_user
+    welcome_message = (
+        f"👋 *Welcome to PixVisionBot, {user.first_name}!*\n\n"
+        f"🎨 *Your Advanced Image Editing Assistant*\n\n"
+        f"I can help you transform your images with powerful editing tools:\n\n"
+        f"🔄 *Flip* - Horizontal, Vertical, or Both\n"
+        f"🔄 *Rotate* - 90°, 180°, or 270°\n"
+        f"🎨 *Filters* - Blur, Sharpen, Contour, and more\n"
+        f"✨ *Effects* - Sepia, Grayscale, Invert, and more\n"
+        f"🎯 *Adjust* - Brightness, Contrast, Saturation\n"
+        f"🖼️ *Border* - Add colorful borders\n\n"
+        f"📤 *Send me an image to get started!*\n"
+        f"Type /help for more commands."
+    )
     
+    keyboard = InlineKeyboardMarkup(MAIN_MENU)
     await update.message.reply_text(
-        "🤖 **Welcome to PixFlipbot!**\n\n"
-        "I can help you with:\n"
-        "🖼️ **Image Conversion** - Convert PNG to JPG, WebP, etc.\n"
-        "🎨 **AI Image Generation** - Create images from text prompts\n"
-        "🔗 **URL Shortening** - Shorten long links instantly\n\n"
-        "Select an option below or send me a file/link directly!",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
+        welcome_message,
+        parse_mode='Markdown',
+        reply_markup=keyboard
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help message"""
-    await update.message.reply_text(
-        "📖 **PixFlipbot Help**\n\n"
+    """Handle /help command"""
+    help_text = (
+        "🤖 *PixVisionBot Help*\n\n"
         "*Commands:*\n"
-        "/start - Show main menu\n"
+        "/start - Start the bot\n"
         "/help - Show this help\n"
-        "/convert - Convert an image\n"
-        "/generate - Generate AI image\n"
-        "/shorten - Shorten a URL\n\n"
+        "/info - Bot information\n"
+        "/effects - All available effects\n"
+        "/cancel - Cancel current operation\n\n"
         "*How to use:*\n"
-        "• Send me an image to convert or compress\n"
-        "• Send me a URL (starting with http) to shorten\n"
-        "• Use /generate followed by your prompt\n\n"
-        "*Example:*\n"
-        "/generate a beautiful sunset over mountains",
-        parse_mode='Markdown'
+        "1️⃣ Send me an image\n"
+        "2️⃣ Use the buttons to edit\n"
+        "3️⃣ Download your creation\n\n"
+        "*Tips:*\n"
+        "• You can apply multiple effects\n"
+        "• Use 'Reset' to start over\n"
+        "• Download anytime to save\n"
+        "• High quality images supported"
     )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
-async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start image conversion process"""
-    user_data[update.effective_user.id] = {'action': 'convert'}
-    await update.message.reply_text(
-        "🖼️ **Image Conversion Mode**\n\n"
-        "Send me an image and I'll convert it!\n"
-        "Supported formats: JPG, PNG, WebP, BMP, GIF\n\n"
-        "You can also send me a photo directly from your gallery.",
-        parse_mode='Markdown'
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /info command"""
+    info_text = (
+        "📊 *PixVisionBot Information*\n\n"
+        "🤖 *Name:* PixVisionBot\n"
+        "📝 *Description:* Advanced Image Editor\n"
+        "👨‍💻 *Developer:* Your Name\n"
+        "📅 *Created:* 2024\n"
+        "🔄 *Version:* 2.0.0\n\n"
+        "*Features:*\n"
+        "• 10+ filters and effects\n"
+        "• Real-time preview\n"
+        "• High quality output\n"
+        "• Batch processing support\n"
+        "• Advanced color adjustments\n\n"
+        "*Stats:*\n"
+        f"• Active Users: {len(user_sessions)}\n"
+        "• Uptime: 24/7\n\n"
+        "🔗 *Links:*\n"
+        "GitHub: https://github.com/yourusername/pixvision-bot"
     )
+    await update.message.reply_text(info_text, parse_mode='Markdown')
 
-async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate AI image from prompt"""
-    prompt = ' '.join(context.args)
-    if not prompt:
-        await update.message.reply_text(
-            "🎨 **AI Image Generation**\n\n"
-            "Usage: `/generate [your prompt]`\n\n"
-            "Example: `/generate a cat riding a unicorn in space`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    await update.message.reply_text(f"🎨 Generating: *{prompt}*\n\n⏳ This may take a few seconds...", parse_mode='Markdown')
-    
-    try:
-        image_data = generate_ai_image(prompt)
-        if image_data:
-            await update.message.reply_photo(
-                photo=BytesIO(image_data),
-                caption=f"🎨 Generated Image\n\nPrompt: {prompt}"
-            )
-        else:
-            await update.message.reply_text("❌ Failed to generate image. Please try again later.")
-    except Exception as e:
-        logger.error(f"Generate error: {e}")
-        await update.message.reply_text("❌ An error occurred while generating the image.")
-
-async def shorten_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shorten a URL"""
-    url = ' '.join(context.args)
-    if not url:
-        await update.message.reply_text(
-            "🔗 **URL Shortener**\n\n"
-            "Usage: `/shorten [your_url]`\n\n"
-            "Example: `/shorten https://example.com/very/long/url`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-    
-    await update.message.reply_text(f"🔗 Shortening: `{url}`", parse_mode='Markdown')
-    
-    short_url = shorten_url(url)
-    if short_url:
-        await update.message.reply_text(
-            f"✅ **URL Shortened!**\n\n"
-            f"🔗 Original: {url}\n"
-            f"✂️ Short: {short_url}"
-        )
-    else:
-        await update.message.reply_text("❌ Failed to shorten URL. Please check the URL and try again.")
-
-# --- Message Handlers ---
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle image messages"""
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /cancel command"""
     user_id = update.effective_user.id
-    action = user_data.get(user_id, {}).get('action', 'convert')
-    
-    await update.message.reply_text("🔄 Processing your image...")
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    await update.message.reply_text("✅ Operation cancelled. Send a new image to start over.")
+
+async def effects_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all available effects"""
+    effects_list = (
+        "🎨 *Available Effects:*\n\n"
+        "*Filters:*\n"
+        "• Blur - Soften image\n"
+        "• Sharpen - Enhance details\n"
+        "• Contour - Outline edges\n"
+        "• Emboss - 3D effect\n"
+        "• Smooth - Reduce noise\n"
+        "• Detail - Enhance texture\n"
+        "• Edge Enhance - Emphasize edges\n"
+        "• Find Edges - Edge detection\n\n"
+        "*Effects:*\n"
+        "• Sepia - Vintage look\n"
+        "• Grayscale - Black & white\n"
+        "• Invert - Negative effect\n"
+        "• Posterize - Reduce colors\n"
+        "• Solarize - Solarization\n"
+        "• Equalize - Enhance contrast\n\n"
+        "*Adjustments:*\n"
+        "• Brightness - Light/Dark\n"
+        "• Contrast - Difference\n"
+        "• Saturation - Color intensity\n\n"
+        "*Transformations:*\n"
+        "• Flip - Mirror image\n"
+        "• Rotate - Change orientation\n"
+        "• Border - Add frame\n\n"
+        "📤 Send an image to start editing!"
+    )
+    await update.message.reply_text(effects_list, parse_mode='Markdown')
+
+# Message Handler
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming photos"""
+    user_id = update.effective_user.id
     
     try:
-        # Get the image file
+        # Get the photo file
         photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
+        file = await photo.get_file()
+        
+        # Download image
         image_bytes = await file.download_as_bytearray()
         
-        # Compress the image
-        compressed = compress_image(image_bytes, quality=80)
+        # Store in session
+        user_sessions[user_id] = {
+            'original': image_bytes,
+            'current': image_bytes,
+            'operations': [],
+            'timestamp': datetime.now().isoformat()
+        }
         
-        # Send both original and compressed
+        # Send confirmation with menu
         await update.message.reply_text(
-            f"✅ **Image Processed!**\n\n"
-            f"📊 Original size: {len(image_bytes) // 1024} KB\n"
-            f"📊 Compressed: {len(compressed) // 1024} KB\n"
-            f"💾 Saved: {((len(image_bytes) - len(compressed)) / len(image_bytes) * 100):.1f}%"
+            "✅ *Image received!*\n\nChoose an editing option below:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU)
         )
-        
-        await update.message.reply_photo(photo=BytesIO(compressed))
-        
-        # Show conversion options
-        keyboard = [
-            [
-                InlineKeyboardButton("🔄 Convert to JPG", callback_data='to_jpg'),
-                InlineKeyboardButton("🔄 Convert to PNG", callback_data='to_png')
-            ],
-            [
-                InlineKeyboardButton("🔄 Convert to WebP", callback_data='to_webp'),
-                InlineKeyboardButton("🔄 Convert to BMP", callback_data='to_bmp')
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "Choose a format to convert this image:",
-            reply_markup=reply_markup
-        )
-        
-        # Store original for conversion
-        user_data[user_id]['original_image'] = image_bytes
         
     except Exception as e:
-        logger.error(f"Image processing error: {e}")
-        await update.message.reply_text("❌ Failed to process image. Please try again.")
+        logger.error(f"Error handling photo: {e}")
+        await update.message.reply_text("❌ Error processing image. Please try again.")
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages (detect URLs)"""
-    text = update.message.text.strip()
-    
-    # Check if it's a URL
-    if text.startswith(('http://', 'https://')):
-        await update.message.reply_text("🔗 Detected a URL! Shortening...")
-        short_url = shorten_url(text)
-        if short_url:
-            await update.message.reply_text(
-                f"✅ **URL Shortened!**\n\n"
-                f"✂️ Short: {short_url}"
-            )
-        else:
-            await update.message.reply_text("❌ Failed to shorten URL.")
-    else:
-        await update.message.reply_text(
-            "I didn't understand that. Use /help to see what I can do!\n\n"
-            "💡 Tip: Send me an image, a URL, or use a command."
-        )
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle document files (images)"""
-    document = update.message.document
-    if document.mime_type and document.mime_type.startswith('image/'):
-        await update.message.reply_text("🔄 Processing your image...")
-        try:
-            file = await context.bot.get_file(document.file_id)
-            image_bytes = await file.download_as_bytearray()
-            
-            # Compress
-            compressed = compress_image(image_bytes, quality=80)
-            await update.message.reply_document(document=BytesIO(compressed), filename=f"compressed_{document.file_name}")
-            
-        except Exception as e:
-            logger.error(f"Document processing error: {e}")
-            await update.message.reply_text("❌ Failed to process image.")
-    else:
-        await update.message.reply_text("⚠️ Please send an image file.")
-
-# --- Callback Query Handlers ---
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button clicks"""
+# Callback Handlers
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback queries"""
     query = update.callback_query
     await query.answer()
     
-    user_id = update.effective_user.id
+    user_id = query.from_user.id
     data = query.data
     
-    if data == 'convert':
+    # Check if user has an image
+    if user_id not in user_sessions:
         await query.edit_message_text(
-            "🖼️ **Image Conversion**\n\n"
-            "Send me an image and I'll convert it to:\n"
-            "• JPG (smaller, web-friendly)\n"
-            "• PNG (transparent background)\n"
-            "• WebP (modern, super compressed)\n"
-            "• BMP (high quality)\n\n"
-            "You can send photos directly from your gallery!",
-            parse_mode='Markdown'
+            "❌ No image found. Please send an image first!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📤 Send Image", callback_data="upload")]])
         )
-        user_data[user_id] = {'action': 'convert'}
-        
-    elif data == 'generate':
-        await query.edit_message_text(
-            "🎨 **AI Image Generation**\n\n"
-            "Usage: `/generate [your prompt]`\n\n"
-            "Example prompts:\n"
-            "• a cyberpunk city at night\n"
-            "• a cute cat astronaut\n"
-            "• a mystical forest with glowing mushrooms\n\n"
-            "Be creative and descriptive!",
-            parse_mode='Markdown'
-        )
-        
-    elif data == 'shorten':
-        await query.edit_message_text(
-            "🔗 **URL Shortener**\n\n"
-            "Usage: `/shorten [your_url]`\n"
-            "or just send me a link directly!\n\n"
-            "Examples:\n"
-            "/shorten https://very-long-url.com/12345\n"
-            "https://another-long-link.com/abcdef",
-            parse_mode='Markdown'
-        )
-        
-    elif data == 'help':
-        await query.edit_message_text(
-            "📖 **PixFlipbot Help**\n\n"
-            "*Features:*\n"
-            "🖼️ Image Compression & Conversion\n"
-            "🎨 AI Image Generation (via Pollinations.ai)\n"
-            "🔗 URL Shortening (via TinyURL)\n\n"
-            "*Quick Start:*\n"
-            "• Send an image → auto compress + convert\n"
-            "• Send a URL → auto shorten\n"
-            "• /generate [prompt] → AI image\n\n"
-            "Made with ❤️",
-            parse_mode='Markdown'
-        )
+        return
     
-    # Image format conversion
-    elif data.startswith('to_'):
-        format_map = {
-            'to_jpg': 'JPEG',
-            'to_png': 'PNG',
-            'to_webp': 'WEBP',
-            'to_bmp': 'BMP'
-        }
+    # Handle navigation
+    if data == "back_main":
+        await query.edit_message_text(
+            "🎨 *Main Menu*\nChoose an editing option:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU)
+        )
+        return
+    
+    # Handle menu navigation
+    if data == "menu_flip":
+        await query.edit_message_text(
+            "🔄 *Flip Options*\nChoose flip direction:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(FLIP_MENU)
+        )
+        return
+    
+    if data == "menu_rotate":
+        await query.edit_message_text(
+            "🔄 *Rotate Options*\nChoose rotation angle:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(ROTATE_MENU)
+        )
+        return
+    
+    if data == "menu_filters":
+        await query.edit_message_text(
+            "🎨 *Filters*\nChoose a filter to apply:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(FILTER_MENU)
+        )
+        return
+    
+    if data == "menu_effects":
+        await query.edit_message_text(
+            "✨ *Effects*\nChoose an effect to apply:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(EFFECTS_MENU)
+        )
+        return
+    
+    if data == "menu_adjust":
+        await query.edit_message_text(
+            "🎯 *Adjustments*\nAdjust image properties:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(ADJUST_MENU)
+        )
+        return
+    
+    if data == "menu_border":
+        await query.edit_message_text(
+            "🖼️ *Border Options*\nChoose border color:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(BORDER_MENU)
+        )
+        return
+    
+    # Handle operations
+    try:
+        session = user_sessions[user_id]
+        current_image = session['current']
+        operations = session.get('operations', [])
         
-        target_format = format_map.get(data)
-        if target_format and user_id in user_data and 'original_image' in user_data[user_id]:
-            try:
-                image_bytes = user_data[user_id]['original_image']
-                converted = convert_image_format(image_bytes, target_format)
+        # Process the operation
+        if data.startswith('flip_'):
+            mode = data.split('_')[1]
+            result = image_processor.flip(current_image, mode)
+            operations.append(f"Flip {mode}")
+            
+        elif data.startswith('rotate_'):
+            angle = int(data.split('_')[1])
+            result = image_processor.rotate(current_image, angle)
+            operations.append(f"Rotate {angle}°")
+            
+        elif data.startswith('filter_'):
+            filter_name = data.split('_')[1]
+            result = image_processor.apply_filter(current_image, filter_name)
+            operations.append(f"Filter: {filter_name.title()}")
+            
+        elif data.startswith('effect_'):
+            effect = data.split('_')[1]
+            result = image_processor.apply_effect(current_image, effect)
+            operations.append(f"Effect: {effect.title()}")
+            
+        elif data.startswith('adjust_'):
+            parts = data.split('_')
+            adjustment = parts[1]
+            direction = parts[2] if len(parts) > 2 else 'up'
+            
+            if adjustment == 'brightness':
+                factor = 1.2 if direction == 'up' else 0.8
+                result = image_processor.adjust_brightness(current_image, factor)
+                operations.append(f"Brightness {'+' if direction == 'up' else '-'}")
+            elif adjustment == 'contrast':
+                factor = 1.2 if direction == 'up' else 0.8
+                result = image_processor.adjust_contrast(current_image, factor)
+                operations.append(f"Contrast {'+' if direction == 'up' else '-'}")
+            elif adjustment == 'saturation':
+                factor = 1.2 if direction == 'up' else 0.8
+                result = image_processor.adjust_saturation(current_image, factor)
+                operations.append(f"Saturation {'+' if direction == 'up' else '-'}")
                 
-                # Determine file extension
-                ext = target_format.lower()
-                if ext == 'jpeg':
-                    ext = 'jpg'
-                
-                await query.edit_message_text(f"✅ Converted to {target_format}!")
-                await query.message.reply_document(
-                    document=BytesIO(converted),
-                    filename=f"converted.{ext}"
-                )
-                
-            except Exception as e:
-                logger.error(f"Conversion error: {e}")
-                await query.edit_message_text("❌ Failed to convert image. Please try again.")
+        elif data.startswith('border_'):
+            color = data.split('_')[1]
+            result = image_processor.add_border(current_image, color=color, width=30)
+            operations.append(f"Border: {color.title()}")
+            
+        elif data == "reset":
+            result = session['original']
+            operations = []
+            session['operations'] = []
+            await query.edit_message_text(
+                "🔄 Image reset to original!",
+                reply_markup=InlineKeyboardMarkup(MAIN_MENU)
+            )
+            # Update session and exit
+            session['current'] = result
+            return
+            
+        elif data == "download":
+            # Send the processed image
+            await query.message.reply_photo(
+                photo=InputFile(io.BytesIO(current_image), filename="edited_image.png"),
+                caption="✅ *Here's your edited image!*\n\nShare your creation with others!",
+                parse_mode='Markdown'
+            )
+            return
+            
+        elif data == "info":
+            await info_command(update, context)
+            return
+            
+        elif data == "upload":
+            await query.edit_message_text("📤 Please send me an image to edit!")
+            return
+            
+        else:
+            await query.edit_message_text("❌ Unknown operation. Please try again.")
+            return
+        
+        # Update session
+        session['current'] = result
+        session['operations'] = operations
+        
+        # Send the processed image with menu
+        await query.message.reply_photo(
+            photo=InputFile(io.BytesIO(result), filename="processed_image.png"),
+            caption=(
+                f"✅ *Image processed!*\n"
+                f"Operations applied: {', '.join(operations) if operations else 'None'}\n\n"
+                f"Choose another option:"
+            ),
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in callback: {e}")
+        await query.edit_message_text(
+            "❌ Error processing image. Please try again or send a new image.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Try Again", callback_data="reset")]])
+        )
 
-# --- Main Application ---
+# Error Handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    
+    try:
+        await update.message.reply_text(
+            "❌ An error occurred. Please try again later or send a new image."
+        )
+    except:
+        pass
+
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    """Main function"""
+    # Create application
+    application = Application.builder().token(TOKEN).build()
     
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("convert", convert_command))
-    app.add_handler(CommandHandler("generate", generate_command))
-    app.add_handler(CommandHandler("shorten", shorten_command))
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("info", info_command))
+    application.add_handler(CommandHandler("effects", effects_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     
-    # Message handlers
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_error_handler(error_handler)
     
-    # Callback handler (for inline buttons)
-    app.add_handler(CallbackQueryHandler(button_callback))
-    
-    logger.info("🤖 PixFlipbot is starting...")
-    app.run_polling(drop_pending_updates=True)
+    # Start bot
+    logger.info("🤖 PixVisionBot is starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
